@@ -19,14 +19,23 @@
 (define-constant ERR_MILESTONE_NOT_FOUND (err u117))
 (define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u118))
 (define-constant ERR_INSUFFICIENT_CIRCLE_MEMBERS (err u119))
+(define-constant ERR_CRISIS_NOT_FOUND (err u120))
+(define-constant ERR_CRISIS_ALREADY_RESOLVED (err u121))
+(define-constant ERR_NOT_CRISIS_RESPONDER (err u122))
+(define-constant ERR_ALREADY_CRISIS_RESPONDER (err u123))
+(define-constant ERR_RESPONDER_NOT_AVAILABLE (err u124))
+(define-constant ERR_CANNOT_RESPOND_TO_OWN_CRISIS (err u125))
+(define-constant ERR_CRISIS_EXPIRED (err u126))
 
 (define-data-var next-member-id uint u1)
 (define-data-var next-session-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-circle-id uint u1)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-crisis-id uint u1)
 (define-data-var total-members uint u0)
 (define-data-var dao-treasury uint u0)
+(define-data-var crisis-response-fund uint u0)
 
 (define-map members
   { member-id: uint }
@@ -137,6 +146,76 @@
 (define-map circle-membership-count
   { member: principal }
   { active-circles: uint }
+)
+
+;; Crisis intervention data structures
+(define-map crisis-events
+  { crisis-id: uint }
+  {
+    person-in-crisis: principal,
+    crisis-type: (string-ascii 50),
+    urgency-level: uint,
+    description: (string-ascii 300),
+    location-info: (optional (string-ascii 100)),
+    created-at: uint,
+    expires-at: uint,
+    status: (string-ascii 20),
+    responder: (optional principal),
+    resolved-at: (optional uint),
+    follow-up-needed: bool
+  }
+)
+
+(define-map crisis-responders
+  { responder: principal }
+  {
+    is-verified: bool,
+    specializations: (string-ascii 100),
+    availability-status: (string-ascii 20),
+    total-responses: uint,
+    average-response-time: uint,
+    crisis-rating: uint,
+    joined-as-responder: uint,
+    last-active: uint
+  }
+)
+
+(define-map crisis-responses
+  { crisis-id: uint, responder: principal }
+  {
+    response-time: uint,
+    initial-contact: (string-ascii 200),
+    support-provided: (string-ascii 300),
+    outcome: (string-ascii 100),
+    follow-up-scheduled: bool,
+    created-at: uint
+  }
+)
+
+(define-map emergency-resources
+  { resource-id: uint }
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 200),
+    resource-type: (string-ascii 30),
+    contact-info: (string-ascii 150),
+    availability: (string-ascii 30),
+    priority-level: uint,
+    added-by: principal,
+    is-active: bool
+  }
+)
+
+(define-map crisis-follow-ups
+  { crisis-id: uint }
+  {
+    check-in-schedule: (string-ascii 50),
+    assigned-supporter: principal,
+    next-check-in: uint,
+    notes: (string-ascii 200),
+    recovery-progress: uint,
+    additional-resources-needed: bool
+  }
 )
 
 (define-public (join-dao)
@@ -594,6 +673,208 @@
   )
 )
 
+;; Crisis intervention public functions
+(define-public (register-as-crisis-responder (specializations (string-ascii 100)))
+  (let
+    (
+      (responder tx-sender)
+    )
+    (asserts! (is-some (map-get? member-addresses { address: responder })) ERR_NOT_MEMBER)
+    (asserts! (is-none (map-get? crisis-responders { responder: responder })) ERR_ALREADY_CRISIS_RESPONDER)
+    (map-set crisis-responders
+      { responder: responder }
+      {
+        is-verified: false,
+        specializations: specializations,
+        availability-status: "available",
+        total-responses: u0,
+        average-response-time: u0,
+        crisis-rating: u0,
+        joined-as-responder: stacks-block-height,
+        last-active: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-crisis-responder (responder principal))
+  (let
+    (
+      (responder-data (unwrap! (map-get? crisis-responders { responder: responder }) ERR_NOT_CRISIS_RESPONDER))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set crisis-responders
+      { responder: responder }
+      (merge responder-data { is-verified: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (signal-crisis (crisis-type (string-ascii 50)) (urgency-level uint) (description (string-ascii 300)) (location-info (optional (string-ascii 100))))
+  (let
+    (
+      (crisis-id (var-get next-crisis-id))
+      (person tx-sender)
+      (expires-at (+ stacks-block-height u288)) ;; Expires in ~48 hours
+    )
+    (asserts! (is-some (map-get? member-addresses { address: person })) ERR_NOT_MEMBER)
+    (asserts! (and (>= urgency-level u1) (<= urgency-level u5)) ERR_INVALID_AMOUNT)
+    (map-set crisis-events
+      { crisis-id: crisis-id }
+      {
+        person-in-crisis: person,
+        crisis-type: crisis-type,
+        urgency-level: urgency-level,
+        description: description,
+        location-info: location-info,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        status: "active",
+        responder: none,
+        resolved-at: none,
+        follow-up-needed: true
+      }
+    )
+    (var-set next-crisis-id (+ crisis-id u1))
+    (ok crisis-id)
+  )
+)
+
+(define-public (respond-to-crisis (crisis-id uint) (initial-contact (string-ascii 200)))
+  (let
+    (
+      (crisis (unwrap! (map-get? crisis-events { crisis-id: crisis-id }) ERR_CRISIS_NOT_FOUND))
+      (responder tx-sender)
+      (responder-data (unwrap! (map-get? crisis-responders { responder: responder }) ERR_NOT_CRISIS_RESPONDER))
+      (response-time (- stacks-block-height (get created-at crisis)))
+    )
+    (asserts! (get is-verified responder-data) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get availability-status responder-data) "available") ERR_RESPONDER_NOT_AVAILABLE)
+    (asserts! (not (is-eq responder (get person-in-crisis crisis))) ERR_CANNOT_RESPOND_TO_OWN_CRISIS)
+    (asserts! (is-eq (get status crisis) "active") ERR_CRISIS_ALREADY_RESOLVED)
+    (asserts! (< stacks-block-height (get expires-at crisis)) ERR_CRISIS_EXPIRED)
+    (map-set crisis-events
+      { crisis-id: crisis-id }
+      (merge crisis {
+        status: "responding",
+        responder: (some responder)
+      })
+    )
+    (map-set crisis-responses
+      { crisis-id: crisis-id, responder: responder }
+      {
+        response-time: response-time,
+        initial-contact: initial-contact,
+        support-provided: "",
+        outcome: "",
+        follow-up-scheduled: false,
+        created-at: stacks-block-height
+      }
+    )
+    (update-responder-stats responder response-time)
+    (ok true)
+  )
+)
+
+(define-public (update-crisis-response (crisis-id uint) (support-provided (string-ascii 300)) (outcome (string-ascii 100)) (follow-up-scheduled bool))
+  (let
+    (
+      (crisis (unwrap! (map-get? crisis-events { crisis-id: crisis-id }) ERR_CRISIS_NOT_FOUND))
+      (responder tx-sender)
+      (response (unwrap! (map-get? crisis-responses { crisis-id: crisis-id, responder: responder }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (is-eq (some responder) (get responder crisis)) ERR_NOT_AUTHORIZED)
+    (map-set crisis-responses
+      { crisis-id: crisis-id, responder: responder }
+      (merge response {
+        support-provided: support-provided,
+        outcome: outcome,
+        follow-up-scheduled: follow-up-scheduled
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-crisis (crisis-id uint))
+  (let
+    (
+      (crisis (unwrap! (map-get? crisis-events { crisis-id: crisis-id }) ERR_CRISIS_NOT_FOUND))
+      (responder tx-sender)
+    )
+    (asserts! (is-eq (some responder) (get responder crisis)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq (get status crisis) "resolved")) ERR_CRISIS_ALREADY_RESOLVED)
+    (map-set crisis-events
+      { crisis-id: crisis-id }
+      (merge crisis {
+        status: "resolved",
+        resolved-at: (some stacks-block-height)
+      })
+    )
+    ;; Pay crisis responder from emergency fund
+    (if (>= (var-get crisis-response-fund) u5000)
+      (begin
+        (try! (as-contract (stx-transfer? u5000 tx-sender responder)))
+        (var-set crisis-response-fund (- (var-get crisis-response-fund) u5000))
+        (ok u5000)
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-public (fund-crisis-response (amount uint))
+  (let
+    (
+      (funder tx-sender)
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount funder (as-contract tx-sender)))
+    (var-set crisis-response-fund (+ (var-get crisis-response-fund) amount))
+    (ok true)
+  )
+)
+
+(define-public (set-responder-availability (status (string-ascii 20)))
+  (let
+    (
+      (responder tx-sender)
+      (responder-data (unwrap! (map-get? crisis-responders { responder: responder }) ERR_NOT_CRISIS_RESPONDER))
+    )
+    (map-set crisis-responders
+      { responder: responder }
+      (merge responder-data {
+        availability-status: status,
+        last-active: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Crisis intervention read-only functions
+(define-read-only (get-crisis-event (crisis-id uint))
+  (map-get? crisis-events { crisis-id: crisis-id })
+)
+
+(define-read-only (get-crisis-responder (responder principal))
+  (map-get? crisis-responders { responder: responder })
+)
+
+(define-read-only (get-crisis-response (crisis-id uint) (responder principal))
+  (map-get? crisis-responses { crisis-id: crisis-id, responder: responder })
+)
+
+(define-read-only (get-crisis-stats)
+  {
+    total-crisis-events: (- (var-get next-crisis-id) u1),
+    crisis-response-fund: (var-get crisis-response-fund),
+    active-responders: u0 ;; Would need iteration to count
+  }
+)
+
 (define-private (update-member-circle-count (member principal) (joining bool))
   (let
     (
@@ -672,3 +953,33 @@
     (ok true)
   )
 )
+
+;; Crisis intervention private helper functions
+(define-private (update-responder-stats (responder principal) (response-time uint))
+  (match (map-get? crisis-responders { responder: responder })
+    responder-data
+      (let
+        (
+          (total-responses (get total-responses responder-data))
+          (current-avg (get average-response-time responder-data))
+          (new-avg (if (is-eq total-responses u0)
+            response-time
+            (/ (+ (* current-avg total-responses) response-time) (+ total-responses u1))
+          ))
+        )
+        (map-set crisis-responders
+          { responder: responder }
+          (merge responder-data {
+            total-responses: (+ total-responses u1),
+            average-response-time: new-avg,
+            last-active: stacks-block-height
+          })
+        )
+        true
+      )
+    false
+  )
+)
+
+
+
